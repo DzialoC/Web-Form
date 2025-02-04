@@ -6,7 +6,7 @@ class DynamicForm {
     this.fields = new Map();
   }
 
-  render() {
+  render(existingData = null) {
     this.container.innerHTML = "";
     const form = document.createElement("form");
     form.className = "needs-validation";
@@ -14,6 +14,11 @@ class DynamicForm {
 
     // Render first row
     this.renderRow(0, form);
+
+    // If we have existing data, populate the form
+    if (existingData) {
+      this.setFormData(existingData);
+    }
 
     const submitButton = document.createElement("button");
     submitButton.type = "submit";
@@ -135,5 +140,109 @@ class DynamicForm {
 
     console.log("Form Data:", formData);
     return formData;
+  }
+
+  // New method to set form data
+  setFormData(data) {
+    // Clear any existing rows except the first one
+    const rowsToRemove = this.currentRows.slice(1);
+    rowsToRemove.forEach((rowIndex) => {
+      const rowElement = this.container.querySelector(
+        `[data-row-id="${rowIndex}"]`
+      );
+      if (rowElement) rowElement.remove();
+    });
+    this.currentRows = this.currentRows.slice(0, 1);
+
+    // Set values for the first row
+    const firstRowConfig = this.rows[0];
+    firstRowConfig.fields.forEach((fieldConfig) => {
+      const field = this.fields.get(fieldConfig.id);
+      if (field && data[fieldConfig.id] !== undefined) {
+        this.setFieldValue(field, data[fieldConfig.id]);
+      }
+    });
+
+    // Trigger branching logic based on field values
+    firstRowConfig.fields.forEach((fieldConfig) => {
+      if (
+        (fieldConfig.type === "radio" || fieldConfig.type === "select") &&
+        data[fieldConfig.id]
+      ) {
+        // Find the row config and trigger branching
+        this.handleBranching(firstRowConfig, fieldConfig, data[fieldConfig.id]);
+
+        // Set values for subsequent rows that were rendered due to branching
+        this.currentRows.slice(1).forEach((rowIndex) => {
+          const rowConfig = this.rows[rowIndex];
+          if (rowConfig) {
+            rowConfig.fields.forEach((fieldConfig) => {
+              const field = this.fields.get(fieldConfig.id);
+              if (field && data[fieldConfig.id] !== undefined) {
+                this.setFieldValue(field, data[fieldConfig.id]);
+              }
+            });
+          }
+        });
+      }
+    });
+  }
+
+  // Helper method to set field value
+  setFieldValue(field, value) {
+    if (!field.element) return;
+
+    switch (field.type) {
+      case "radio":
+        const radioInput = field.element.querySelector(
+          `input[value="${value}"]`
+        );
+        if (radioInput) radioInput.checked = true;
+        break;
+
+      case "checkbox":
+        const checkboxInput = field.element.querySelector("input");
+        if (checkboxInput) checkboxInput.checked = value;
+        break;
+
+      case "table":
+        const tbody = field.element.querySelector("tbody");
+        if (tbody) {
+          // Clear existing rows
+          tbody.innerHTML = "";
+          // Add rows for each data item
+          if (Array.isArray(value)) {
+            value.forEach((rowData) => {
+              field.addTableRow(tbody);
+              const lastRow = tbody.lastElementChild;
+              Object.entries(rowData).forEach(([key, cellValue]) => {
+                const input = lastRow.querySelector(`[name*="_${key}_"]`);
+                if (input) input.value = cellValue;
+              });
+            });
+          }
+        }
+        break;
+
+      case "file":
+        // Files can't be pre-populated due to security restrictions
+        // But we can show the filename if provided
+        if (value && value.name) {
+          const preview = field.element.querySelector(`#${field.id}_preview`);
+          if (preview) {
+            preview.innerHTML = `
+              <div class="alert alert-info">
+                Current file: ${value.name}
+              </div>
+            `;
+          }
+        }
+        break;
+
+      default:
+        const input = field.element.querySelector("input, select, textarea");
+        if (input) input.value = value;
+        break;
+    }
   }
 }
