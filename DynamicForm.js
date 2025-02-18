@@ -4,6 +4,7 @@ class DynamicForm {
     this.rows = rows;
     this.currentRows = [];
     this.fields = new Map();
+    this.branchHistory = {};
   }
 
   render(existingData = null) {
@@ -81,6 +82,13 @@ class DynamicForm {
     // Determine the intended branch row based on the new value
     let intendedBranchRow = null;
     if (rowConfig.branchConditions) {
+      // Add support for defaultBranch
+      const defaultBranch = rowConfig.branchConditions.find(
+        (condition) =>
+          condition.fieldId === fieldConfig.id &&
+          condition.defaultBranch === true
+      );
+
       for (const condition of rowConfig.branchConditions) {
         if (condition.fieldId === fieldConfig.id) {
           let shouldBranch = false;
@@ -89,6 +97,9 @@ class DynamicForm {
               condition.operator === "or"
                 ? condition.value.includes(value)
                 : condition.value.every((v) => v === value);
+          } else if (condition.defaultBranch) {
+            // If this is a default branch condition, always branch
+            shouldBranch = true;
           } else {
             shouldBranch = condition.value === value;
           }
@@ -98,9 +109,18 @@ class DynamicForm {
           }
         }
       }
+
+      // If no specific condition matched but we have a default branch, use it
+      if (intendedBranchRow === null && defaultBranch) {
+        intendedBranchRow = defaultBranch.nextRow;
+      }
     }
     if (intendedBranchRow === null) {
       intendedBranchRow = rowConfig.id + 1;
+    }
+    // Update branch history to record the chosen branch for this row
+    if (rowConfig.branchConditions) {
+      this.branchHistory[rowConfig.id] = intendedBranchRow;
     }
     // If the branch remains unchanged (the next row is already the intended branch), do nothing.
     if (this.currentRows[currentIndex + 1] === intendedBranchRow) {
@@ -133,7 +153,8 @@ class DynamicForm {
         formData[fieldId] = value;
       }
     });
-
+    // Append branch history in stringified format to the form submission data
+    formData.branchHistory = JSON.stringify(this.branchHistory);
     console.log("Form Data:", formData);
     return formData;
   }
