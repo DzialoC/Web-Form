@@ -73,31 +73,17 @@ class DynamicForm {
       currentRows: this.currentRows,
       conditions: rowConfig.branchConditions,
     });
-
-    // Find the index of the current row by its ID
     const currentIndex = this.currentRows.findIndex(
       (rowId) => rowId === rowConfig.id
     );
     console.log("Current Index:", currentIndex);
-
     if (currentIndex === -1) return;
-
-    // Remove all subsequent rows
-    const rowsToRemove = this.currentRows.slice(currentIndex + 1);
-    rowsToRemove.forEach((rowIndex) => {
-      const rowElement = this.container.querySelector(
-        `[data-row-id="${rowIndex}"]`
-      );
-      if (rowElement) rowElement.remove();
-    });
-    this.currentRows = this.currentRows.slice(0, currentIndex + 1);
-
-    // Find the next row based on branching conditions
+    // Determine the intended branch row based on the new value
+    let intendedBranchRow = null;
     if (rowConfig.branchConditions) {
       for (const condition of rowConfig.branchConditions) {
         if (condition.fieldId === fieldConfig.id) {
           let shouldBranch = false;
-
           if (Array.isArray(condition.value)) {
             shouldBranch =
               condition.operator === "or"
@@ -106,22 +92,32 @@ class DynamicForm {
           } else {
             shouldBranch = condition.value === value;
           }
-
           if (shouldBranch) {
-            this.renderRow(
-              condition.nextRow,
-              this.container.querySelector("form")
-            );
-            return;
+            intendedBranchRow = condition.nextRow;
+            break;
           }
         }
       }
     }
-
-    // If no branch conditions met, render next sequential row
-    const nextRowIndex = rowConfig.id + 1;
-    if (nextRowIndex < this.rows.length) {
-      this.renderRow(nextRowIndex, this.container.querySelector("form"));
+    if (intendedBranchRow === null) {
+      intendedBranchRow = rowConfig.id + 1;
+    }
+    // If the branch remains unchanged (the next row is already the intended branch), do nothing.
+    if (this.currentRows[currentIndex + 1] === intendedBranchRow) {
+      return;
+    }
+    // Otherwise remove all subsequent rows and render the new branch row
+    const rowsToRemove = this.currentRows.slice(currentIndex + 1);
+    rowsToRemove.forEach((rowIndex) => {
+      const rowElement = this.container.querySelector(
+        `[data-row-id="${rowIndex}"]`
+      );
+      if (rowElement) rowElement.remove();
+    });
+    this.currentRows = this.currentRows.slice(0, currentIndex + 1);
+    const form = this.container.querySelector("form");
+    if (intendedBranchRow < this.rows.length) {
+      this.renderRow(intendedBranchRow, form);
     }
   }
 
