@@ -1,330 +1,600 @@
 class SharePointService {
-  constructor(config) {
-    this.parentList = config.parentList;
-    this.childLists = config.childLists || {};
-    this.siteUrl = config.siteUrl;
+  /**
+   * @param {string} parentListName - The parent list name
+   * @param {string[]} childListNames - Array of child list names
+   * @param {string} webUrl - The SharePoint site URL
+   */
+  constructor(parentListName, childListNames, webUrl) {
+    this.parentListName = parentListName;
+    this.childListNames = childListNames || [];
+    this.webUrl = webUrl;
 
-    // Verify jQuery and SPServices are available
-    if (typeof jQuery === "undefined") {
-      throw new Error("jQuery is required but not loaded");
-    }
-    if (typeof $().SPServices === "undefined") {
-      throw new Error("SPServices is required but not loaded");
-    }
+    // Optionally set a default webURL for all SPServices calls:
+    // $().SPServices.defaults.webURL = this.webUrl;
+    // Or pass it directly in each operation as shown below.
   }
 
-  // Get form data by ID
-  async getFormData(id) {
-    try {
-      // Get parent list item
-      const parentData = await this.getListItem(this.parentList, id);
-      if (!parentData) {
-        throw new Error(
-          `No item found with ID ${id} in list ${this.parentList}`
-        );
+  /**
+   * High-level method to submit the entire form data, which includes:
+   * - creating/updating the parent item
+   * - upserting the child items (tables, signatures, etc.)
+   * - adding attachments if present
+   *
+   * @param {Array} formData - The dynamic form data array.
+   *                          Example structure:
+   * [
+   *   {
+   *     id: "MyParentList",
+   *     spItemId: 10, // if existing item to update
+   *     fields: [
+   *       { name: "Title", value: "Some Title" },
+   *       { name: "AnotherField", value: "Some Value" }
+   *     ]
+   *   },
+   *   {
+   *     id: "ChildListA",
+   *     type: "table",
+   *     tableConfig: {
+   *       data: [
+   *         { spItemId: 1, Column1: "Foo", Column2: "Bar" },
+   *         { spItemId: null, Column1: "NewOne", Column2: "Data" }
+   *       ]
+   *     }
+   *   },
+   *   {
+   *     id: "ChildListB",
+   *     type: "signature",
+   *     options: [
+   *       { name: "SignatureField", value: "Some Base64 or text" }
+   *     ]
+   *   },
+   *   {
+   *     id: "Attachments",
+   *     type: "attachments",
+   *     files: [ FileObject1, FileObject2 ]
+   *   }
+   * ]
+   *
+   * @returns {Promise<void>}
+   */
+  submitForm(formData) {
+    return new Promise((resolve, reject) => {
+      // 1) Find the parent object in formData
+      const parentObj = formData.find(
+        (item) => item.id === this.parentListName
+      );
+      if (!parentObj) {
+        const errMsg = `Parent data not found in formData for list "${this.parentListName}"`;
+        console.error(errMsg);
+        reject(errMsg);
+        return;
       }
 
-      // Get attachments if any
-      if (parentData.Attachments) {
-        const attachmentInfo = await this.getAttachments(this.parentList, id);
-        if (attachmentInfo.length > 0) {
-          parentData.attachments = attachmentInfo.map((att) => ({
-            name: att.name,
-            serverUrl: att.serverUrl,
-          }));
-        }
+      // Convert parent fields array -> key/value pairs
+      const parentFieldValues = {};
+      if (Array.isArray(parentObj.fields)) {
+        parentObj.fields.forEach((f) => {
+          parentFieldValues[f.name] = f.value;
+        });
       }
 
-      // Get child list items
-      const formData = { ...parentData };
-      for (const [childKey, childList] of Object.entries(this.childLists)) {
-        const childItems = await this.getChildItems(childList, id);
-        formData[childKey] = childItems;
+      // 2) Create or update the parent item
+      let parentPromise;
+      if (parentObj.spItemId) {
+        // Update existing parent item
+        parentPromise = this.updateItem(
+          this.parentListName,
+          parentObj.spItemId,
+          parentFieldValues
+        ).then(() => parentObj.spItemId);
+      } else {
+        // Create new parent item
+        parentPromise = this.createItem(this.parentListName, parentFieldValues);
       }
 
-      return formData;
-    } catch (error) {
-      this.handleError("Error getting form data", error);
-      throw error;
-    }
-  }
+      let parentItemId;
 
-  // Submit new form
-  async submitForm(formData) {
-    try {
-      // Create parent item first
-      const parentData = this.extractParentData(formData);
-      const parentId = await this.createListItem(this.parentList, parentData);
+      parentPromise
+        .then((id) => {
+          parentItemId = id;
+          console.log(
+            `Parent item ${
+              parentObj.spItemId ? "updated" : "created"
+            } with ID: ${id}`
+          );
 
-      // Create child items with lookup to parent
-      for (const [childKey, childList] of Object.entries(this.childLists)) {
-        if (formData[childKey] && Array.isArray(formData[childKey])) {
-          for (const childItem of formData[childKey]) {
-            await this.createListItem(childList.name, {
-              ...childItem,
-              [childList.lookupField]: parentId,
-            });
-          }
-        }
-      }
+          // 3) Upsert child items for each child list in this.childListNames
+          const childPromises = [];
+          this.childListNames.forEach((childList) => {
+            // Find formData entry with id == childList
+            const childObj = formData.find((item) => item.id === childList);
+            if (!childObj) return; // Not all child lists must be present in the form
 
-      // Handle attachments if any
-      if (formData.attachments) {
-        await this.addAttachments(
-          this.parentList,
-          parentId,
-          formData.attachments
-        );
-      }
-
-      return parentId;
-    } catch (error) {
-      this.handleError("Error submitting form", error);
-      throw error;
-    }
-  }
-
-  // Update existing form
-  async updateForm(id, formData) {
-    try {
-      // Update parent item
-      const parentData = this.extractParentData(formData);
-      await this.updateListItem(this.parentList, id, parentData);
-
-      // Handle child items
-      for (const [childKey, childList] of Object.entries(this.childLists)) {
-        if (formData[childKey] && Array.isArray(formData[childKey])) {
-          // Get existing child items
-          const existingChildren = await this.getChildItems(childList, id);
-
-          // Delete removed items
-          for (const existingChild of existingChildren) {
-            if (
-              !formData[childKey].find(
-                (newChild) => newChild.Id === existingChild.Id
-              )
-            ) {
-              await this.deleteListItem(childList.name, existingChild.Id);
-            }
-          }
-
-          // Update or create child items
-          for (const childItem of formData[childKey]) {
-            if (childItem.Id) {
-              await this.updateListItem(
-                childList.name,
-                childItem.Id,
-                childItem
+            // Depending on the "type", parse the rows for upsert
+            // Example: if type === "table", childObj.tableConfig.data is an array of row objects
+            if (childObj.type === "table" && childObj.tableConfig) {
+              const rowData = childObj.tableConfig.data || [];
+              childPromises.push(
+                this.upsertChildItems(
+                  childList,
+                  this.parentListName,
+                  parentItemId,
+                  rowData
+                )
               );
-            } else {
-              await this.createListItem(childList.name, {
-                ...childItem,
-                [childList.lookupField]: id,
+            } else if (
+              childObj.type === "signature" &&
+              Array.isArray(childObj.options)
+            ) {
+              // Suppose each "options" entry corresponds to a column
+              // Convert array into a single-row object or multiple rows as needed
+              // For simplicity, let's assume one single row for the signature
+              const rowData = [{}];
+              childObj.options.forEach((opt) => {
+                rowData[0][opt.name] = opt.value;
               });
+              // If there's an spItemId in childObj, you might track that too
+              if (childObj.spItemId) {
+                rowData[0].spItemId = childObj.spItemId;
+              }
+              childPromises.push(
+                this.upsertChildItems(
+                  childList,
+                  this.parentListName,
+                  parentItemId,
+                  rowData
+                )
+              );
             }
-          }
-        }
-      }
-
-      // Handle attachments
-      if (formData.attachments) {
-        await this.updateAttachments(this.parentList, id, formData.attachments);
-      }
-
-      return id;
-    } catch (error) {
-      this.handleError("Error updating form", error);
-      throw error;
-    }
-  }
-
-  // Private methods for SharePoint operations
-  async getListItem(listName, id) {
-    return new Promise((resolve, reject) => {
-      $().SPServices({
-        operation: "GetListItems",
-        listName: listName,
-        CAMLQuery: `<Query><Where><Eq><FieldRef Name='ID'/><Value Type='Counter'>${id}</Value></Eq></Where></Query>`,
-        completefunc: (xData, status) => {
-          if (status === "success") {
-            const items = $(xData.responseXML)
-              .SPFilterNode("z:row")
-              .map((_, row) => {
-                return this.parseSpItem(row);
-              })
-              .get();
-            resolve(items[0]);
-          } else {
-            reject(new Error(`Failed to get item: ${status}`));
-          }
-        },
-      });
-    });
-  }
-
-  async getChildItems(childList, parentId) {
-    return new Promise((resolve, reject) => {
-      $().SPServices({
-        operation: "GetListItems",
-        listName: childList.name,
-        CAMLQuery: `<Query><Where><Eq><FieldRef Name='${childList.lookupField}'/><Value Type='Lookup'>${parentId}</Value></Eq></Where></Query>`,
-        completefunc: (xData, status) => {
-          if (status === "success") {
-            const items = $(xData.responseXML)
-              .SPFilterNode("z:row")
-              .map((_, row) => {
-                return this.parseSpItem(row);
-              })
-              .get();
-            resolve(items);
-          } else {
-            reject(new Error(`Failed to get child items: ${status}`));
-          }
-        },
-      });
-    });
-  }
-
-  async createListItem(listName, itemData) {
-    return new Promise((resolve, reject) => {
-      $().SPServices({
-        operation: "UpdateListItems",
-        listName: listName,
-        updates: this.prepareUpdateBatch([["New", "", itemData]]),
-        completefunc: (xData, status) => {
-          if (status === "success") {
-            const newId = $(xData.responseXML)
-              .SPFilterNode("z:row")
-              .attr("ows_ID");
-            resolve(newId);
-          } else {
-            reject(new Error(`Failed to create item: ${status}`));
-          }
-        },
-      });
-    });
-  }
-
-  async updateListItem(listName, id, itemData) {
-    return new Promise((resolve, reject) => {
-      $().SPServices({
-        operation: "UpdateListItems",
-        listName: listName,
-        updates: this.prepareUpdateBatch([["Update", id, itemData]]),
-        completefunc: (xData, status) => {
-          if (status === "success") {
-            resolve(id);
-          } else {
-            reject(new Error(`Failed to update item: ${status}`));
-          }
-        },
-      });
-    });
-  }
-
-  async deleteListItem(listName, id) {
-    return new Promise((resolve, reject) => {
-      $().SPServices({
-        operation: "UpdateListItems",
-        listName: listName,
-        updates: this.prepareUpdateBatch([["Delete", id, {}]]),
-        completefunc: (xData, status) => {
-          if (status === "success") {
-            resolve();
-          } else {
-            reject(new Error(`Failed to delete item: ${status}`));
-          }
-        },
-      });
-    });
-  }
-
-  async addAttachments(listName, id, files) {
-    for (const file of files) {
-      await this.addAttachment(listName, id, file);
-    }
-  }
-
-  async addAttachment(listName, id, file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        try {
-          await $().SPServices({
-            operation: "AddAttachment",
-            listName: listName,
-            listItemID: id,
-            fileName: file.name,
-            attachment: e.target.result.split(",")[1],
+            // Expand logic for other possible childObj types as you wish...
           });
+
+          return Promise.all(childPromises);
+        })
+        .then(() => {
+          console.log("All child items created/updated successfully (if any).");
+
+          // 4) Check if there's an "attachments" object
+          const attachmentObj = formData.find(
+            (item) => item.type === "attachments"
+          );
+          if (attachmentObj && Array.isArray(attachmentObj.files)) {
+            // Attach each file to the parent item
+            const attachPromises = [];
+            attachmentObj.files.forEach((file) => {
+              attachPromises.push(
+                this.addAttachment(this.parentListName, parentItemId, file)
+              );
+            });
+            return Promise.all(attachPromises);
+          }
+        })
+        .then(() => {
+          console.log("Attachments uploaded successfully (if any).");
           resolve();
-        } catch (error) {
-          reject(error);
-        }
-      };
-      reader.readAsDataURL(file);
+        })
+        .catch((err) => {
+          console.error("submitForm error:", err);
+          reject(err);
+        });
     });
   }
 
-  // Helper methods
-  parseSpItem(row) {
-    const item = {};
-    for (const attr of row.attributes) {
-      if (attr.name.startsWith("ows_")) {
-        const fieldName = attr.name.substring(4);
-        item[fieldName] = this.parseSpValue(attr.value);
-      }
-    }
-    return item;
+  // ----------------------------------------------------------------
+  // Below are the CRUD and attachment methods, updated to include webUrl:
+  // ----------------------------------------------------------------
+
+  createItem(listName, fieldValues) {
+    return new Promise((resolve, reject) => {
+      $().SPServices({
+        operation: "UpdateListItems",
+        webURL: this.webUrl,
+        async: true,
+        listName: listName,
+        updates: this._buildBatchXml(fieldValues, "New"),
+        completefunc: (xData, status) => {
+          const errorText = $(xData.responseXML)
+            .SPFilterNode("ErrorText")
+            .text();
+          if (errorText) {
+            console.error(
+              `Error creating item in list [${listName}]:`,
+              errorText
+            );
+            return reject(errorText);
+          }
+
+          const newID = $(xData.responseXML)
+            .SPFilterNode("z:row")
+            .attr("ows_ID");
+          resolve(parseInt(newID, 10));
+        },
+      });
+    });
   }
 
-  parseSpValue(value) {
-    if (value.includes(";#")) {
-      const parts = value.split(";#");
-      if (parts.length === 2) {
-        return { id: parts[0], value: parts[1] };
-      }
-      return parts.reduce((acc, part, i) => {
-        if (i % 2 === 0) {
-          acc.push({ id: part, value: parts[i + 1] });
-        }
-        return acc;
-      }, []);
-    }
-    return value;
+  updateItem(listName, itemId, fieldValues) {
+    return new Promise((resolve, reject) => {
+      $().SPServices({
+        operation: "UpdateListItems",
+        webURL: this.webUrl,
+        async: true,
+        listName: listName,
+        updates: this._buildBatchXml(fieldValues, "Update", itemId),
+        completefunc: (xData, status) => {
+          const errorText = $(xData.responseXML)
+            .SPFilterNode("ErrorText")
+            .text();
+          if (errorText) {
+            console.error(
+              `Error updating item [ID=${itemId}] in list [${listName}]:`,
+              errorText
+            );
+            return reject(errorText);
+          }
+          resolve();
+        },
+      });
+    });
   }
 
-  prepareUpdateBatch(updates) {
-    const batch = new Array();
-    updates.forEach(([operation, id, data]) => {
-      const fields = Object.entries(data)
-        .map(([field, value]) => {
-          return `<Field Name='${field}'>${value}</Field>`;
+  /**
+   * Fetches the parent item and all child items that reference it.
+   * @param {number} parentItemId - The ID of the parent item in the parent list.
+   * @returns {Promise<Object>} - Resolves to the JSON object described.
+   */
+  getForm(parentItemId) {
+    // We'll build a final result object
+    const finalResult = {};
+
+    // 1) Fetch the parent item
+    const parentPromise = new Promise((resolve, reject) => {
+      $().SPServices({
+        operation: "GetListItems",
+        webURL: this.webUrl,
+        async: true,
+        listName: this.parentListName,
+        CAMLQuery: `
+         <Query>
+           <Where>
+             <Eq>
+               <FieldRef Name="ID" />
+               <Value Type="Counter">${parentItemId}</Value>
+             </Eq>
+           </Where>
+         </Query>
+       `,
+        completefunc: (xData, status) => {
+          const errorText = $(xData.responseXML)
+            .SPFilterNode("ErrorText")
+            .text();
+          if (errorText) {
+            console.error(
+              `Error reading parent item [ID=${parentItemId}] from list [${this.parentListName}]:`,
+              errorText
+            );
+            return reject(errorText);
+          }
+
+          const rows = $(xData.responseXML).SPFilterNode("z:row");
+          if (rows.length === 0) {
+            // No parent item found - resolve with an empty object or handle as error
+            console.warn(
+              `No parent item found with ID=${parentItemId} in list [${this.parentListName}].`
+            );
+            return resolve({});
+          }
+
+          // We assume only one row because we're querying by ID
+          const row = rows.first();
+
+          // Put the parent ID in finalResult
+          const parentID = row.attr("ows_ID");
+          finalResult.ID = parentID;
+
+          // Convert each attribute into a key/value in finalResult, skipping empty or null
+          $.each(row[0].attributes, (idx, attr) => {
+            if (attr.name.indexOf("ows_") === 0) {
+              const fieldName = attr.name.substring(4);
+              const fieldValue = attr.value;
+              // Skip if empty or null, also skip if fieldName is "ID" (already handled above)
+              if (
+                !fieldValue ||
+                fieldValue.trim() === "" ||
+                fieldName === "ID"
+              ) {
+                return;
+              }
+              finalResult[fieldName] = fieldValue;
+            }
+          });
+
+          resolve(finalResult);
+        },
+      });
+    });
+
+    // 2) For each child list, fetch items that reference the parent
+    const childPromises = this.childListNames.map((childListName) => {
+      return new Promise((resolve, reject) => {
+        const camlQuery = `
+         <Query>
+           <Where>
+             <Eq>
+               <FieldRef Name="${this.parentListName}" LookupId="TRUE" />
+               <Value Type="Lookup">${parentItemId}</Value>
+             </Eq>
+           </Where>
+         </Query>
+       `;
+        $().SPServices({
+          operation: "GetListItems",
+          webURL: this.webUrl,
+          async: true,
+          listName: childListName,
+          CAMLQuery: camlQuery,
+          completefunc: (xData, status) => {
+            const errorText = $(xData.responseXML)
+              .SPFilterNode("ErrorText")
+              .text();
+            if (errorText) {
+              console.error(
+                `Error fetching child items from [${childListName}] for parent [ID=${parentItemId}]:`,
+                errorText
+              );
+              return reject(errorText);
+            }
+
+            const rows = $(xData.responseXML).SPFilterNode("z:row");
+            const items = [];
+            rows.each(function () {
+              const rowObj = {};
+              $.each(this.attributes, (idx, attr) => {
+                if (attr.name.indexOf("ows_") === 0) {
+                  const fieldName = attr.name.substring(4);
+                  const fieldValue = attr.value;
+                  if (!fieldValue || fieldValue.trim() === "") {
+                    return; // skip empty or null
+                  }
+                  if (fieldName === "ID") {
+                    // We'll put the child's ID under "ID"
+                    rowObj.ID = fieldValue;
+                  } else {
+                    rowObj[fieldName] = fieldValue;
+                  }
+                }
+              });
+              items.push(rowObj);
+            });
+
+            resolve({ childListName, items });
+          },
+        });
+      });
+    });
+
+    // 3) Combine results
+    return parentPromise
+      .then(() => Promise.all(childPromises))
+      .then((childResults) => {
+        // childResults is an array of { childListName, items } objects
+        childResults.forEach(({ childListName, items }) => {
+          // For each child list, store the array of items in finalResult[childListName]
+          finalResult[childListName] = items;
+        });
+        return finalResult;
+      })
+      .catch((err) => {
+        console.error("getForm error:", err);
+        throw err;
+      });
+  }
+
+  deleteItem(listName, itemId) {
+    return new Promise((resolve, reject) => {
+      $().SPServices({
+        operation: "UpdateListItems",
+        webURL: this.webUrl,
+        async: true,
+        listName: listName,
+        updates: `
+          <Batch OnError="Continue" ListVersion="1" ViewName="">
+            <Method ID="1" Cmd="Delete">
+              <Field Name="ID">${itemId}</Field>
+            </Method>
+          </Batch>`,
+        completefunc: (xData, status) => {
+          const errorText = $(xData.responseXML)
+            .SPFilterNode("ErrorText")
+            .text();
+          if (errorText) {
+            console.error(
+              `Error deleting item [ID=${itemId}] in list [${listName}]:`,
+              errorText
+            );
+            return reject(errorText);
+          }
+          resolve();
+        },
+      });
+    });
+  }
+
+  /**
+   * Upsert (create or update) multiple child items in a single batch.
+   * The lookup column in the child list is assumed to have the same name
+   * as the parent list (i.e., "this.parentListName").
+   *
+   * @param {string} childListName
+   * @param {string} parentListName
+   * @param {number} parentId
+   * @param {Array<object>} rowsData
+   *    Each row has { spItemId, SomeColumn: value, AnotherCol: value, ... }
+   * @returns {Promise<void>}
+   */
+  upsertChildItems(childListName, parentListName, parentId, rowsData) {
+    return new Promise((resolve, reject) => {
+      const batchItems = rowsData
+        .map((row, idx) => {
+          const cmd = row.spItemId ? "Update" : "New";
+          return this._buildBatchMethodXml(
+            cmd,
+            row.spItemId,
+            {
+              [parentListName]: parentId,
+              ...row,
+            },
+            idx + 1
+          );
         })
         .join("");
-      batch.push(
-        `<Method ID='${batch.length + 1}' Cmd='${operation}'>${
-          id ? `<Field Name='ID'>${id}</Field>` : ""
-        }${fields}</Method>`
-      );
+
+      const batchXml = `<Batch OnError="Continue" ListVersion="1" ViewName="">${batchItems}</Batch>`;
+
+      $().SPServices({
+        operation: "UpdateListItems",
+        webURL: this.webUrl,
+        async: true,
+        listName: childListName,
+        updates: batchXml,
+        completefunc: (xData, status) => {
+          const errorText = $(xData.responseXML)
+            .SPFilterNode("ErrorText")
+            .text();
+          if (errorText) {
+            console.error(
+              `Error upserting child items in list [${childListName}]:`,
+              errorText
+            );
+            return reject(errorText);
+          }
+          resolve();
+        },
+      });
     });
-    return `<Batch>${batch.join("")}</Batch>`;
   }
 
-  handleError(message, error) {
-    console.error(message, error);
-    window.alert(`${message}: ${error.message}`);
+  /**
+   * Add an attachment to a given item in a list.
+   * @param {string} listName
+   * @param {number} itemId
+   * @param {File} file - The file to attach (HTML File object)
+   */
+  addAttachment(listName, itemId, file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const fileContent = e.target.result.split("base64,")[1]; // everything after "base64,"
+        $().SPServices({
+          operation: "AddAttachment",
+          webURL: this.webUrl,
+          async: true,
+          listName: listName,
+          listItemID: itemId,
+          fileName: file.name,
+          attachment: fileContent,
+          completefunc: (xData, status) => {
+            const errorText = $(xData.responseXML)
+              .SPFilterNode("ErrorText")
+              .text();
+            if (errorText) {
+              console.error(
+                `Error adding attachment [${file.name}] to item [ID=${itemId}] in [${listName}]:`,
+                errorText
+              );
+              return reject(errorText);
+            }
+            resolve();
+          },
+        });
+      };
+      reader.onerror = (err) => {
+        console.error("FileReader error:", err);
+        reject(err);
+      };
+      reader.readAsDataURL(file); // read file as base64
+    });
   }
 
-  extractParentData(formData) {
-    // Remove child list data and attachments from parent data
-    const parentData = { ...formData };
-    Object.keys(this.childLists).forEach((key) => delete parentData[key]);
-    delete parentData.attachments;
-    return parentData;
+  /**
+   * Delete an attachment from a given item in a list.
+   * @param {string} listName
+   * @param {number} itemId
+   * @param {string} fileName
+   */
+  deleteAttachment(listName, itemId, fileName) {
+    return new Promise((resolve, reject) => {
+      $().SPServices({
+        operation: "DeleteAttachment",
+        webURL: this.webUrl,
+        async: true,
+        listName: listName,
+        listItemID: itemId,
+        url: fileName, // Must match the attached file's name (or server-relative URL)
+        completefunc: (xData, status) => {
+          const errorText = $(xData.responseXML)
+            .SPFilterNode("ErrorText")
+            .text();
+          if (errorText) {
+            console.error(
+              `Error deleting attachment [${fileName}] from item [ID=${itemId}] in [${listName}]:`,
+              errorText
+            );
+            return reject(errorText);
+          }
+          resolve();
+        },
+      });
+    });
   }
 
-  async getAttachmentUrl(listName, itemId, fileName) {
-    return `${this.siteUrl}/_layouts/download.aspx?SourceUrl=${this.siteUrl}/Lists/${listName}/Attachments/${itemId}/${fileName}`;
+  // ------------------------------------------
+  // Helper methods for building CAML XML
+  // ------------------------------------------
+
+  _buildBatchXml(fieldValues, cmd, itemId) {
+    const methodId = "1";
+    const batch = `
+      <Batch OnError="Continue" ListVersion="1" ViewName="">
+        ${this._buildBatchMethodXml(cmd, itemId, fieldValues, methodId)}
+      </Batch>
+    `;
+    return batch;
+  }
+
+  _buildBatchMethodXml(cmd, itemId, fieldValues, methodId) {
+    let methodXml = `<Method ID="${methodId}" Cmd="${cmd}">`;
+    if (itemId) {
+      methodXml += `<Field Name="ID">${itemId}</Field>`;
+    }
+    for (const [fieldName, fieldValue] of Object.entries(fieldValues)) {
+      if (fieldName === "spItemId") continue; // skip our custom tracking field
+      methodXml += `<Field Name="${fieldName}">${this._escapeXml(
+        fieldValue
+      )}</Field>`;
+    }
+    methodXml += `</Method>`;
+    return methodXml;
+  }
+
+  _buildViewFields(fieldNames) {
+    if (!fieldNames || !fieldNames.length) {
+      return "";
+    }
+    let viewFieldsXml = "<ViewFields>";
+    fieldNames.forEach((name) => {
+      viewFieldsXml += `<FieldRef Name="${name}" />`;
+    });
+    viewFieldsXml += "</ViewFields>";
+    return viewFieldsXml;
+  }
+
+  _escapeXml(value) {
+    if (value == null) return "";
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
 }
